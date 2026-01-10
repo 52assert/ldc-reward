@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LINUXDO 打赏助手
 // @namespace    tbphp.reward.ldc
-// @version      1.0.1
+// @version      1.0.3
 // @description  为 Linux.do 社区帖子添加 LDC 打赏功能
 // @author       @tbphp
 // @match        https://linux.do/*
@@ -67,7 +67,6 @@
       AVATAR: ".post-avatar img",
       FULL_NAME: ".names .first.full-name a",
       CONTROLS: ".post-controls .actions",
-      REWARD_BUTTON: ".reward-button",
     },
 
     // Regular expressions
@@ -378,16 +377,38 @@
           // Remove from pending regardless of result
           pendingRewards.delete(requestKey);
 
+          // Check if response is JSON
+          const contentType = response.responseHeaders.match(/content-type:\s*([^\r\n;]+)/i);
+          const isJSON = contentType && contentType[1].includes('application/json');
+
+          // Handle non-2xx status codes
+          if (response.status !== 200) {
+            const statusText = `HTTP ${response.status}`;
+            if (isJSON) {
+              try {
+                const result = JSON.parse(response.responseText);
+                callback(false, `${statusText}: ${result.error_msg || result.message || "请求失败"}`);
+              } catch (e) {
+                callback(false, `${statusText}: 服务器返回错误，可能配置错误或者超频次。`);
+              }
+            } else {
+              // Non-JSON response (likely HTML error page)
+              callback(false, `${statusText}: 服务器返回错误，可能配置错误或者超频次。`);
+            }
+            return;
+          }
+
+          // Handle 200 response
           try {
             const result = JSON.parse(response.responseText);
-            if (response.status === 200 && !result.error_msg) {
+            if (!result.error_msg) {
               callback(true, result.data.trade_no);
             } else {
               callback(false, result.error_msg || "未知错误");
             }
           } catch (e) {
             Utils.handleError(ErrorTypes.PARSE_ERROR, e);
-            callback(false, "响应解析失败: " + e.message);
+            callback(false, "响应解析失败，服务器可能返回了错误页面");
           }
         },
         onerror: function (error) {
@@ -864,9 +885,9 @@
         document.querySelectorAll(CONFIG.SELECTORS.ARTICLE)
       );
 
-      // Filter articles that don't have reward buttons yet
+      // Filter articles that haven't been processed yet (using custom attribute)
       const articlesToProcess = articles.filter(
-        (article) => !article.querySelector(CONFIG.SELECTORS.REWARD_BUTTON)
+        (article) => !article.dataset.rewardAdded
       );
 
       if (articlesToProcess.length === 0) {
@@ -882,6 +903,9 @@
 
         for (let i = index; i < end; i++) {
           const article = articlesToProcess[i];
+
+          // Mark as processed immediately to prevent duplicate processing
+          article.dataset.rewardAdded = "true";
 
           // Check for like button - if absent, it's user's own post
           const likeButton = article.querySelector(
