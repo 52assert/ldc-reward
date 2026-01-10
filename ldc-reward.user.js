@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LINUXDO 打赏助手
 // @namespace    tbphp.reward.ldc
-// @version      1.0.4
+// @version      1.0.5
 // @description  为 Linux.do 社区帖子添加 LDC 打赏功能
 // @author       @tbphp
 // @match        https://linux.do/*
@@ -61,8 +61,7 @@
     // CSS selectors
     SELECTORS: {
       ARTICLE: "article[data-user-id]",
-      LIKE_BUTTON:
-        ".btn-toggle-reaction-like, .discourse-reactions-reaction-button",
+      LIKE_BUTTON: ".discourse-reactions-reaction-button:not(.my-likes)",
       USER_CARD: "[data-user-card]",
       AVATAR: ".post-avatar img",
       FULL_NAME: ".names .first.full-name a",
