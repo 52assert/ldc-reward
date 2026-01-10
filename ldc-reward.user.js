@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LINUXDO 打赏助手
-// @namespace    tbphp.reward.linuxdo
-// @version      1.0.0
+// @namespace    tbphp.reward.ldc
+// @version      1.0.1
 // @description  为 Linux.do 社区帖子添加 LDC 打赏功能
 // @author       @tbphp
 // @match        https://linux.do/*
@@ -26,7 +26,7 @@
    */
   const CONFIG = {
     // Storage key for user credentials
-    STORAGE_KEY: "linuxdo_reward_config",
+    STORAGE_KEY: "ldc_reward_config",
 
     // Quick amount options for reward (LDC)
     QUICK_AMOUNTS: [1, 5, 10, 50],
