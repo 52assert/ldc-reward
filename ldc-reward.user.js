@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LINUXDO 打赏助手
 // @namespace    tbphp.reward.ldc
-// @version      1.0.3
+// @version      1.0.4
 // @description  为 Linux.do 社区帖子添加 LDC 打赏功能
 // @author       @tbphp
 // @match        https://linux.do/*
@@ -33,7 +33,7 @@
 
     // Timing configuration (milliseconds)
     TIMING: {
-      DEBOUNCE_DELAY: 300,
+      DEBOUNCE_DELAY: 50,
       URL_CHECK_INTERVAL: 500,
       INITIAL_LOAD_DELAY: 500,
       ROUTE_CHANGE_DELAY: 1000,
@@ -67,6 +67,7 @@
       AVATAR: ".post-avatar img",
       FULL_NAME: ".names .first.full-name a",
       CONTROLS: ".post-controls .actions",
+      REWARD_BUTTON: ".reward-button",
     },
 
     // Regular expressions
@@ -378,8 +379,11 @@
           pendingRewards.delete(requestKey);
 
           // Check if response is JSON
-          const contentType = response.responseHeaders.match(/content-type:\s*([^\r\n;]+)/i);
-          const isJSON = contentType && contentType[1].includes('application/json');
+          const contentType = response.responseHeaders.match(
+            /content-type:\s*([^\r\n;]+)/i
+          );
+          const isJSON =
+            contentType && contentType[1].includes("application/json");
 
           // Handle non-2xx status codes
           if (response.status !== 200) {
@@ -387,13 +391,24 @@
             if (isJSON) {
               try {
                 const result = JSON.parse(response.responseText);
-                callback(false, `${statusText}: ${result.error_msg || result.message || "请求失败"}`);
+                callback(
+                  false,
+                  `${statusText}: ${
+                    result.error_msg || result.message || "请求失败"
+                  }`
+                );
               } catch (e) {
-                callback(false, `${statusText}: 服务器返回错误，可能配置错误或者超频次。`);
+                callback(
+                  false,
+                  `${statusText}: 服务器返回错误，可能配置错误或者超频次。`
+                );
               }
             } else {
               // Non-JSON response (likely HTML error page)
-              callback(false, `${statusText}: 服务器返回错误，可能配置错误或者超频次。`);
+              callback(
+                false,
+                `${statusText}: 服务器返回错误，可能配置错误或者超频次。`
+              );
             }
             return;
           }
@@ -872,127 +887,98 @@
 
   const DOMManager = {
     /**
-     * Add reward buttons to all posts (batch processing with requestAnimationFrame)
+     * Add reward buttons to all posts
      */
     addRewardButtons() {
-      // Only add buttons on topic pages
+      // 1. 仅在帖子详情页执行
       if (!Utils.isTopicPage()) {
         return;
       }
 
-      // Select all article elements
-      const articles = Array.from(
-        document.querySelectorAll(CONFIG.SELECTORS.ARTICLE)
-      );
+      // 2. 获取所有帖子元素
+      const articles = document.querySelectorAll(CONFIG.SELECTORS.ARTICLE);
 
-      // Filter articles that haven't been processed yet (using custom attribute)
-      const articlesToProcess = articles.filter(
-        (article) => !article.dataset.rewardAdded
-      );
+      articles.forEach((article) => {
+        // --- 核心修复：更严格的检查逻辑 ---
 
-      if (articlesToProcess.length === 0) {
-        return;
-      }
+        // 找到操作栏容器
+        const controls = article.querySelector(CONFIG.SELECTORS.CONTROLS);
+        if (!controls) {
+          return;
+        }
 
-      // Process in batches using requestAnimationFrame
-      let index = 0;
-      const batchSize = CONFIG.PERFORMANCE.BATCH_SIZE;
+        // 检查 1: 如果容器里已经有打赏按钮了，直接跳过 (防止重复)
+        if (controls.querySelector(CONFIG.SELECTORS.REWARD_BUTTON)) {
+          return;
+        }
 
-      function processBatch() {
-        const end = Math.min(index + batchSize, articlesToProcess.length);
+        // 检查 2: 如果找不到点赞按钮，说明可能是系统消息或特殊帖子，跳过
+        const likeButton = article.querySelector(CONFIG.SELECTORS.LIKE_BUTTON);
+        if (!likeButton) {
+          return;
+        }
+        const userId = article.getAttribute("data-user-id");
+        const usernameElement = article.querySelector(
+          CONFIG.SELECTORS.USER_CARD
+        );
+        const username = usernameElement?.getAttribute("data-user-card");
+        const avatarElement = article.querySelector(CONFIG.SELECTORS.AVATAR);
+        const avatarUrl = avatarElement?.src;
 
-        for (let i = index; i < end; i++) {
-          const article = articlesToProcess[i];
+        // Get full name (prefer display name, fallback to username)
+        const fullNameElement = article.querySelector(
+          CONFIG.SELECTORS.FULL_NAME
+        );
+        const fullName = fullNameElement?.textContent?.trim() || username;
 
-          // Mark as processed immediately to prevent duplicate processing
-          article.dataset.rewardAdded = "true";
+        // Get topic ID and post ID
+        const topicId = Utils.getTopicId();
+        const postId = Utils.getPostId(article);
 
-          // Check for like button - if absent, it's user's own post
-          const likeButton = article.querySelector(
-            CONFIG.SELECTORS.LIKE_BUTTON
-          );
-          if (!likeButton) {
-            continue;
-          }
+        if (!userId || !username || !topicId || !postId) {
+          return;
+        }
 
-          // Get user info
-          const userId = article.getAttribute("data-user-id");
-          const usernameElement = article.querySelector(
-            CONFIG.SELECTORS.USER_CARD
-          );
-          const username = usernameElement?.getAttribute("data-user-card");
-          const avatarElement = article.querySelector(CONFIG.SELECTORS.AVATAR);
-          const avatarUrl = avatarElement?.src;
-
-          // Get full name (prefer display name, fallback to username)
-          const fullNameElement = article.querySelector(
-            CONFIG.SELECTORS.FULL_NAME
-          );
-          const fullName = fullNameElement?.textContent?.trim() || username;
-
-          // Get topic ID and post ID
-          const topicId = Utils.getTopicId();
-          const postId = Utils.getPostId(article);
-
-          if (!userId || !username || !topicId || !postId) {
-            continue;
-          }
-
-          // Create reward button
-          const rewardBtn = document.createElement("button");
-          rewardBtn.className = "reward-button btn btn-icon-text btn-flat";
-          rewardBtn.innerHTML = `
+        // Create reward button
+        const rewardBtn = document.createElement("button");
+        rewardBtn.className = "reward-button btn btn-icon-text btn-flat";
+        rewardBtn.innerHTML = `
             <svg class="fa d-icon d-icon-coins svg-icon svg-string" style="width: 16px; height: 16px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
               <path fill="currentColor" d="M512 80c0 18-14.3 34.6-38.4 48c-29.1 16.1-72.5 27.5-122.3 30.9c-3.7-1.8-7.4-3.5-11.3-5C300.6 137.4 248.2 128 192 128c-8.3 0-16.4 .2-24.5 .6l-1.1-.6C142.3 114.6 128 98 128 80c0-44.2 86-80 192-80S512 35.8 512 80zM160.7 161.1c10.2-.7 20.7-1.1 31.3-1.1c62.2 0 117.4 12.3 152.5 31.4C369.3 204.9 384 221.7 384 240c0 4-.7 7.9-2.1 11.7c-4.6 13.2-17 25.3-35 35.5c0 0 0 0 0 0c-.1 .1-.3 .1-.4 .2l0 0 0 0c-.3 .2-.6 .3-.9 .5c-35 19.4-90.8 32-153.6 32c-59.6 0-112.9-11.3-148.2-29.1c-1.9-.9-3.7-1.9-5.5-2.9C14.3 274.6 0 258 0 240c0-34.8 53.4-64.5 128-75.4c10.5-1.5 21.4-2.7 32.7-3.5zM416 240c0-21.9-10.6-39.9-24.1-53.4c28.3-4.4 54.2-11.4 76.2-20.5c16.3-6.8 31.5-15.2 43.9-25.5V176c0 19.3-16.5 37.1-43.8 50.9c-14.6 7.4-32.4 13.7-52.4 18.5c.1-1.8 .2-3.5 .2-5.3zm-32 96c0 18-14.3 34.6-38.4 48c-1.8 1-3.6 1.9-5.5 2.9C304.9 404.7 251.6 416 192 416c-62.8 0-118.6-12.6-153.6-32C14.3 370.6 0 354 0 336V300.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 342.6 135.8 352 192 352s108.6-9.4 148.1-25.9c7.8-3.2 15.3-6.9 22.4-10.9c6.1-3.4 11.8-7.2 17.2-11.2c1.5-1.1 2.9-2.3 4.3-3.4V304v5.7V336zm32 0V304 278.1c19-4.2 36.5-9.5 52.1-16c16.3-6.8 31.5-15.2 43.9-25.5V272c0 10.5-5 21-14.9 30.9c-16.3 16.3-45 29.7-81.3 38.4c.1-1.7 .2-3.5 .2-5.3zM192 448c56.2 0 108.6-9.4 148.1-25.9c16.3-6.8 31.5-15.2 43.9-25.5V432c0 44.2-86 80-192 80S0 476.2 0 432V396.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 438.6 135.8 448 192 448z"/>
-            </svg>
-            <span class="d-button-label">打赏</span>
-          `;
-          rewardBtn.style.cssText = `
-            color: #f59e0b;
-            margin-left: 5px;
-          `;
-          rewardBtn.title = `打赏 ${fullName}`;
+        </svg>
+        <span class="d-button-label">打赏</span>
+        `;
+        rewardBtn.style.cssText = `
+          color: #f59e0b;
+          margin-left: 5px;
+          display: flex; /* 确保图标对齐 */
+          align-items: center;
+        `;
+        rewardBtn.title = `打赏 ${fullName}`;
 
-          rewardBtn.onclick = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-
-            // Check configuration when clicked
-            const config = ConfigManager.get();
-            if (!config) {
-              if (confirm("您还未配置打赏凭证，是否现在配置？")) {
-                UIManager.showConfigDialog();
-              }
-              return;
+        rewardBtn.onclick = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const config = ConfigManager.get();
+          if (!config) {
+            if (confirm("您还未配置打赏凭证，是否现在配置？")) {
+              UIManager.showConfigDialog();
             }
-
-            UIManager.showRewardDialog(
-              userId,
-              username,
-              avatarUrl,
-              fullName,
-              topicId,
-              postId
-            );
-          };
-
-          // Insert button into controls
-          const controls = article.querySelector(CONFIG.SELECTORS.CONTROLS);
-          if (controls) {
-            controls.insertBefore(rewardBtn, controls.firstChild);
+            return;
           }
-        }
+          UIManager.showRewardDialog(
+            userId,
+            username,
+            avatarUrl,
+            fullName,
+            topicId,
+            postId
+          );
+        };
 
-        index = end;
-
-        // Continue with next batch if needed
-        if (index < articlesToProcess.length) {
-          requestAnimationFrame(processBatch);
-        }
-      }
-
-      // Start processing first batch
-      requestAnimationFrame(processBatch);
+        // 插入按钮到第一个位置
+        controls.insertBefore(rewardBtn, controls.firstChild);
+      });
     },
 
     /**
