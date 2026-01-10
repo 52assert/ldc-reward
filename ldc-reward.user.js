@@ -319,7 +319,6 @@
     for (const [key, value] of pendingRewards.entries()) {
       if (now - value.timestamp > expireTime) {
         pendingRewards.delete(key);
-        console.log(`[打赏助手] 清理过期请求锁: ${key}`);
       }
     }
   }
@@ -989,7 +988,6 @@
       setInterval(() => {
         if (currentUrl !== location.href) {
           currentUrl = location.href;
-          console.log("[打赏助手] 检测到路由变化:", currentUrl);
 
           // Delay to wait for page rendering
           setTimeout(() => {
