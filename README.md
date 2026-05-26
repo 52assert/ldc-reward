@@ -76,6 +76,10 @@ LDR_T789409_P1_1767983344195_8511
 
 感谢原作者 [@tbphp](https://linux.do/u/tbphp) 编写并开源 LINUXDO 打赏助手。本仓库在原脚本基础上做兼容性修复和维护。
 
+## 友情链接
+
+- [LINUX DO - 新的理想型社区](https://linux.do/)
+
 ## License
 
 MIT
