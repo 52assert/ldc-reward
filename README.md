@@ -39,28 +39,6 @@
 - 脚本只会向 `credit.linux.do` 发起打赏请求。
 - 请不要把自己的 `Client Secret`、`Authorization` 或 Cookie 提交到仓库、Issues 或评论区。
 
-## 单号规则
-
-开启可选字段后，脚本会按下面规则生成业务单号：
-
-```text
-LDR_T{topicId}_P{postId}_{timestamp}_{random4digits}
-```
-
-例如：
-
-```text
-LDR_T789409_P1_1767983344195_8511
-```
-
-可以解析为：
-
-- 帖子 ID：`789409`
-- 楼层 ID：`1`
-- 对应链接：`https://linux.do/t/topic/789409/1`
-
-当前版本默认只发送 `user_id`、`username`、`amount`，以贴近新版接口的实际调用方式。如需发送 `out_trade_no` 和 `remark`，可在脚本中将 `CONFIG.API.INCLUDE_OPTIONAL_FIELDS` 改为 `true`。
-
 ## 变更说明
 
 相对原脚本，本版本主要修改：
