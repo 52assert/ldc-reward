@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         LINUXDO 打赏助手
-// @namespace    tbphp.reward.ldc
-// @version      1.0.5
-// @description  为 Linux.do 社区帖子添加 LDC 打赏功能
-// @author       @tbphp
+// @namespace    dream.linuxdo.reward.ldc
+// @version      1.0.6
+// @description  为 Linux.do 社区帖子添加 LDC 打赏按钮，适配 credit.linux.do 新版 lpay/distribute 接口，并修复严格 CSP 下的内联事件报错。
+// @author       dream
 // @match        https://linux.do/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -14,26 +14,19 @@
 // @license      MIT
 // ==/UserScript==
 
+// 基于 @tbphp 的 LINUXDO 打赏助手修改，许可证保持 MIT。
+// 脚本会向 https://credit.linux.do/lpay/distribute 发送打赏请求。
+// Client ID / Client Secret 通过 GM_setValue 保存在本地油猴存储中，不会发送到第三方服务。
+
 (function () {
   "use strict";
 
-  // ============================================================================
-  // Configuration Constants
-  // ============================================================================
-
-  /**
-   * Global configuration object
-   */
   const CONFIG = {
-    // Storage key for user credentials
-    STORAGE_KEY: "ldc_reward_config",
-
-    // Quick amount options for reward (LDC)
+    STORAGE_KEY: "ldc_reward_config_patched",
     QUICK_AMOUNTS: [1, 5, 10, 50],
 
-    // Timing configuration (milliseconds)
     TIMING: {
-      DEBOUNCE_DELAY: 50,
+      DEBOUNCE_DELAY: 250,
       URL_CHECK_INTERVAL: 500,
       INITIAL_LOAD_DELAY: 500,
       ROUTE_CHANGE_DELAY: 1000,
@@ -41,24 +34,28 @@
       API_TIMEOUT: 30000,
     },
 
-    // Performance configuration
     PERFORMANCE: {
-      BATCH_SIZE: 5, // Number of buttons to process per frame
+      BATCH_SIZE: 5,
     },
 
-    // Amount limits
     AMOUNT: {
       MIN: 0.01,
       MAX: 10000,
     },
 
-    // API configuration
     API: {
-      ENDPOINT: "https://credit.linux.do/epay/pay/distribute",
+      ENDPOINT: "https://credit.linux.do/lpay/distribute",
       DOCS_URL: "https://credit.linux.do/docs/how-to-use",
+      CREDIT_ORIGIN: "https://credit.linux.do",
+      CREDIT_REFERER: "https://credit.linux.do/merchant",
+
+      // false 更贴近你抓到的 curl：只发送 user_id / username / amount。
+      // 如果你确认服务端接受 remark/out_trade_no，可以改成 true。
+      INCLUDE_OPTIONAL_FIELDS: false,
+      TRY_SPOOF_CREDIT_HEADERS: true,
+      DEBUG: true,
     },
 
-    // CSS selectors
     SELECTORS: {
       ARTICLE: "article[data-user-id]",
       LIKE_BUTTON: ".discourse-reactions-reaction-button:not(.my-likes)",
@@ -69,15 +66,11 @@
       REWARD_BUTTON: ".reward-button",
     },
 
-    // Regular expressions
     REGEX: {
       TOPIC_PAGE: /^https:\/\/linux\.do\/t\/topic\/\d+/,
     },
   };
 
-  /**
-   * Style constants for UI elements
-   */
   const STYLES = {
     overlay: `
       position: fixed;
@@ -165,9 +158,6 @@
     `,
   };
 
-  /**
-   * Error type enumeration
-   */
   const ErrorTypes = {
     NETWORK_ERROR: "网络请求失败",
     TIMEOUT_ERROR: "请求超时",
@@ -177,17 +167,7 @@
     API_ERROR: "API 错误",
   };
 
-  // ============================================================================
-  // Utils Module - Common utility functions
-  // ============================================================================
-
   const Utils = {
-    /**
-     * Generate unique trade number with topic and post information
-     * @param {string} topicId - Topic ID from URL
-     * @param {string} postId - Post ID from article element
-     * @returns {string} Trade number in format LDR_T{topicId}_P{postId}_{timestamp}_{random4digits}
-     */
     generateTradeNo(topicId, postId) {
       const timestamp = Date.now();
       const random = Math.floor(Math.random() * 10000)
@@ -196,71 +176,97 @@
       return `LDR_T${topicId}_P${postId}_${timestamp}_${random}`;
     },
 
-    /**
-     * Extract topic ID from current URL
-     * @returns {string|null} Topic ID or null if not found
-     */
     getTopicId() {
       const match = location.href.match(/\/t\/topic\/(\d+)/);
       return match ? match[1] : null;
     },
 
-    /**
-     * Extract post ID from article element
-     * @param {HTMLElement} article - Article element
-     * @returns {string|null} Post ID or null if not found
-     */
     getPostId(article) {
       const id = article.getAttribute("id");
-      if (id) {
-        const match = id.match(/post_(\d+)/);
-        return match ? match[1] : null;
+      if (!id) {
+        return null;
       }
-      return null;
+
+      const match = id.match(/post_(\d+)/);
+      return match ? match[1] : null;
     },
 
-    /**
-     * Check if current page is a topic page
-     * @returns {boolean} True if current page matches topic pattern
-     */
     isTopicPage() {
       return CONFIG.REGEX.TOPIC_PAGE.test(location.href);
     },
 
-    /**
-     * Unified error handling
-     * @param {string} type - Error type from ErrorTypes
-     * @param {*} details - Error details
-     */
     handleError(type, details) {
       console.error(`[打赏助手] ${type}:`, details);
     },
+
+    debug(...args) {
+      if (CONFIG.API.DEBUG) {
+        console.log("[打赏助手]", ...args);
+      }
+    },
+
+    escapeHTML(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (char) => {
+        const chars = {
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        };
+        return chars[char];
+      });
+    },
+
+    escapeAttr(value) {
+      return this.escapeHTML(value);
+    },
+
+    hexToRgba(hex, alpha) {
+      const match = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(
+        String(hex || "")
+      );
+      if (!match) {
+        return `rgba(59,130,246,${alpha})`;
+      }
+
+      return `rgba(${parseInt(match[1], 16)},${parseInt(
+        match[2],
+        16
+      )},${parseInt(match[3], 16)},${alpha})`;
+    },
+
+    sanitizeUrl(value) {
+      try {
+        const url = new URL(String(value || ""), location.href);
+        if (url.protocol === "http:" || url.protocol === "https:") {
+          return url.href;
+        }
+      } catch (error) {
+        Utils.handleError(ErrorTypes.VALIDATION_ERROR, error);
+      }
+      return "";
+    },
+
   };
 
-  // ============================================================================
-  // ConfigManager Module - Handle user configuration
-  // ============================================================================
-
-  /**
-   * Flag to track if configuration prompt has been shown
-   */
   let hasPromptedConfig = false;
 
   const ConfigManager = {
-    /**
-     * Get stored configuration
-     * @returns {Object|null} Configuration object with client_id and client_secret, or null if not configured
-     */
     get() {
       const config = GM_getValue(CONFIG.STORAGE_KEY);
-      return config ? JSON.parse(config) : null;
+      if (!config) {
+        return null;
+      }
+
+      try {
+        return typeof config === "string" ? JSON.parse(config) : config;
+      } catch (error) {
+        Utils.handleError(ErrorTypes.CONFIG_ERROR, error);
+        return null;
+      }
     },
 
-    /**
-     * Save configuration
-     * @param {string} clientId - Client ID
-     * @param {string} clientSecret - Client Secret
-     */
     save(clientId, clientSecret) {
       GM_setValue(
         CONFIG.STORAGE_KEY,
@@ -271,21 +277,22 @@
       );
     },
 
-    /**
-     * Check if configuration exists
-     * @returns {boolean} True if configured
-     */
-    isConfigured() {
-      return !!this.get();
+    hasUsableConfig(config) {
+      if (!config) {
+        return false;
+      }
+
+      return !!String(config.client_id || "").trim() &&
+        !!String(config.client_secret || "").trim();
     },
 
-    /**
-     * Check and prompt for configuration if needed
-     * @returns {boolean} True if already configured
-     */
+    isConfigured() {
+      return this.hasUsableConfig(this.get());
+    },
+
     checkAndPrompt() {
       const config = this.get();
-      if (!config && !hasPromptedConfig) {
+      if (!this.hasUsableConfig(config) && !hasPromptedConfig) {
         hasPromptedConfig = true;
         setTimeout(() => {
           if (confirm("检测到您是首次使用打赏功能，是否现在配置？")) {
@@ -294,26 +301,15 @@
         }, CONFIG.TIMING.CONFIG_PROMPT_DELAY);
         return false;
       }
-      return !!config;
+      return true;
     },
   };
 
-  // ============================================================================
-  // RewardAPI Module - Handle reward API calls
-  // ============================================================================
-
-  /**
-   * Pending reward requests to prevent duplicates
-   * Key format: "topicId_postId_userId"
-   */
   const pendingRewards = new Map();
 
-  /**
-   * Clean up expired pending requests (older than 2 minutes)
-   */
   function cleanupExpiredPendingRewards() {
     const now = Date.now();
-    const expireTime = 2 * 60 * 1000; // 2 minutes
+    const expireTime = 2 * 60 * 1000;
 
     for (const [key, value] of pendingRewards.entries()) {
       if (now - value.timestamp > expireTime) {
@@ -322,200 +318,226 @@
     }
   }
 
-  // Clean up expired locks every minute
   setInterval(cleanupExpiredPendingRewards, 60 * 1000);
 
   const RewardAPI = {
-    /**
-     * Send reward request to API
-     * @param {string} userId - Target user ID
-     * @param {string} username - Target username
-     * @param {number} amount - Reward amount in LDC
-     * @param {string} remark - Remark text
-     * @param {string} topicId - Topic ID
-     * @param {string} postId - Post ID
-     * @param {Function} callback - Callback function (success: boolean, message: string) => void
-     */
+    buildAuthorization(config) {
+      const clientId = String(config?.client_id || "").trim();
+      const clientSecret = String(config?.client_secret || "").trim();
+      if (!clientId || !clientSecret) {
+        return null;
+      }
+
+      const encoded = btoa(`${clientId}:${clientSecret}`);
+      return {
+        value: `Basic ${encoded}`,
+        source: "client-id-secret",
+        preview: `${encoded.slice(0, 8)}...`,
+      };
+    },
+
+    buildHeaders(authorization) {
+      const headers = {
+        Accept: "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Content-Type": "application/json",
+        Authorization: authorization.value,
+      };
+
+      if (CONFIG.API.TRY_SPOOF_CREDIT_HEADERS) {
+        // Tampermonkey/浏览器可能会忽略或覆盖这些受保护请求头。
+        headers.Origin = CONFIG.API.CREDIT_ORIGIN;
+        headers.Referer = CONFIG.API.CREDIT_REFERER;
+        headers["User-Agent"] = navigator.userAgent;
+      }
+
+      return headers;
+    },
+
+    parseApiMessage(response) {
+      const body = String(response.responseText || "");
+      try {
+        const result = JSON.parse(body);
+        return (
+          result.error_msg ||
+          result.message ||
+          result.msg ||
+          result.error ||
+          "请求失败"
+        );
+      } catch (error) {
+        const compactBody = body.replace(/\s+/g, " ").trim();
+        if (/cloudflare|attention required|just a moment/i.test(compactBody)) {
+          return "疑似被 Cloudflare/来源检查拦截，详情见控制台 response body";
+        }
+        return compactBody.slice(0, 300) || "服务器返回非 JSON 响应";
+      }
+    },
+
     sendReward(userId, username, amount, remark, topicId, postId, callback) {
       const config = ConfigManager.get();
-      if (!config) {
+      if (!ConfigManager.hasUsableConfig(config)) {
         callback(false, "请先配置 Client ID 和 Client Secret");
         return;
       }
 
-      // Check for pending request to prevent duplicates
-      const requestKey = `${topicId}_${postId}_${userId}`;
+      const authorization = this.buildAuthorization(config);
+      if (!authorization) {
+        callback(false, "打赏凭证不完整");
+        return;
+      }
+
+      const parsedUserId = Number.parseInt(userId, 10);
+      const parsedAmount = Number(amount);
+      const requestKey = `${topicId}_${postId}_${parsedUserId}`;
+
       if (pendingRewards.has(requestKey)) {
         callback(false, "该打赏请求正在处理中，请勿重复提交");
         return;
       }
 
-      const auth = btoa(`${config.client_id}:${config.client_secret}`);
       const tradeNo = Utils.generateTradeNo(topicId, postId);
+      const payload = {
+        user_id: parsedUserId,
+        username,
+        amount: parsedAmount,
+      };
 
-      // Mark as pending
+      if (CONFIG.API.INCLUDE_OPTIONAL_FIELDS) {
+        payload.out_trade_no = tradeNo;
+        payload.remark = remark;
+      }
+
       pendingRewards.set(requestKey, {
-        tradeNo: tradeNo,
+        tradeNo,
         timestamp: Date.now(),
       });
 
-      GM_xmlhttpRequest({
+      const requestDetails = {
         method: "POST",
         url: CONFIG.API.ENDPOINT,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Basic ${auth}`,
-        },
-        data: JSON.stringify({
-          user_id: parseInt(userId),
-          username: username,
-          amount: amount,
-          out_trade_no: tradeNo,
-          remark: remark,
-        }),
-        onload: function (response) {
-          // Remove from pending regardless of result
+        headers: this.buildHeaders(authorization),
+        data: JSON.stringify(payload),
+        anonymous: false,
+        withCredentials: true,
+        timeout: CONFIG.TIMING.API_TIMEOUT,
+        onload: (response) => {
           pendingRewards.delete(requestKey);
 
-          // Check if response is JSON
-          const contentType = response.responseHeaders.match(
-            /content-type:\s*([^\r\n;]+)/i
-          );
-          const isJSON =
-            contentType && contentType[1].includes("application/json");
+          const status = Number(response.status);
+          const responseHeaders = String(response.responseHeaders || "");
+          const body = String(response.responseText || "");
 
-          // Handle non-2xx status codes
-          if (response.status !== 200) {
-            const statusText = `HTTP ${response.status}`;
-            if (isJSON) {
-              try {
-                const result = JSON.parse(response.responseText);
-                callback(
-                  false,
-                  `${statusText}: ${
-                    result.error_msg || result.message || "请求失败"
-                  }`
-                );
-              } catch (e) {
-                callback(
-                  false,
-                  `${statusText}: 服务器返回错误，可能配置错误或者超频次。`
-                );
-              }
-            } else {
-              // Non-JSON response (likely HTML error page)
-              callback(
-                false,
-                `${statusText}: 服务器返回错误，可能配置错误或者超频次。`
-              );
-            }
+          if (status !== 200) {
+            console.warn("[打赏助手] API HTTP error", {
+              status,
+              headers: responseHeaders,
+              body: body.slice(0, 2000),
+            });
+            callback(false, `HTTP ${status}: ${this.parseApiMessage(response)}`);
             return;
           }
 
-          // Handle 200 response
           try {
-            const result = JSON.parse(response.responseText);
-            if (!result.error_msg) {
-              callback(true, result.data.trade_no);
-            } else {
-              callback(false, result.error_msg || "未知错误");
+            const result = JSON.parse(body);
+            const ok =
+              result.code === 1 ||
+              result.success === true ||
+              (!result.error_msg && !result.error && result.data);
+
+            if (ok) {
+              const tradeNoFromResponse =
+                result.data?.trade_no || result.trade_no || tradeNo;
+              callback(true, tradeNoFromResponse);
+              return;
             }
-          } catch (e) {
-            Utils.handleError(ErrorTypes.PARSE_ERROR, e);
+
+            callback(
+              false,
+              result.error_msg ||
+                result.message ||
+                result.msg ||
+                result.error ||
+                "未知错误"
+            );
+          } catch (error) {
+            Utils.handleError(ErrorTypes.PARSE_ERROR, error);
+            console.warn("[打赏助手] API parse error body", body.slice(0, 2000));
             callback(false, "响应解析失败，服务器可能返回了错误页面");
           }
         },
-        onerror: function (error) {
-          // Remove from pending on error
+        onerror: (error) => {
           pendingRewards.delete(requestKey);
           Utils.handleError(ErrorTypes.NETWORK_ERROR, error);
           callback(false, ErrorTypes.NETWORK_ERROR);
         },
-        ontimeout: function () {
-          // Remove from pending on timeout
+        ontimeout: () => {
           pendingRewards.delete(requestKey);
           Utils.handleError(ErrorTypes.TIMEOUT_ERROR, "Request timeout");
           callback(false, ErrorTypes.TIMEOUT_ERROR);
         },
-        timeout: CONFIG.TIMING.API_TIMEOUT,
+      };
+
+      Utils.debug("request", {
+        endpoint: CONFIG.API.ENDPOINT,
+        authSource: authorization.source,
+        authPreview: authorization.preview,
+        payload,
+        spoofHeaders: CONFIG.API.TRY_SPOOF_CREDIT_HEADERS,
       });
+
+      try {
+        GM_xmlhttpRequest(requestDetails);
+      } catch (error) {
+        pendingRewards.delete(requestKey);
+        Utils.handleError(ErrorTypes.NETWORK_ERROR, error);
+        callback(false, `请求发起失败：${error?.message || error}`);
+      }
     },
   };
 
-  // ============================================================================
-  // UIComponents Module - Reusable UI components
-  // ============================================================================
-
   const UIComponents = {
-    /**
-     * Create overlay with content
-     * @param {string} content - HTML content
-     * @param {string} width - Dialog width (default: 480px)
-     * @returns {HTMLElement} Overlay element
-     */
     createOverlay(content, width = "480px") {
       const overlay = document.createElement("div");
       overlay.style.cssText = STYLES.overlay;
       overlay.innerHTML = `
-        <div style="${STYLES.dialog} width: ${width};">
+        <div style="${STYLES.dialog} width: ${Utils.escapeAttr(width)};">
           ${content}
         </div>
       `;
 
-      // Click outside to close
-      overlay.onclick = (e) => {
-        if (e.target === overlay) {
+      overlay.addEventListener("click", (event) => {
+        if (event.target === overlay) {
           overlay.remove();
         }
-      };
+      });
 
       return overlay;
     },
 
-    /**
-     * Create input field component
-     * @param {Object} config - Input configuration
-     * @param {string} config.id - Input element ID
-     * @param {string} config.label - Label text
-     * @param {string} config.type - Input type (default: text)
-     * @param {string} config.placeholder - Placeholder text
-     * @param {string} config.value - Initial value
-     * @param {string} config.attrs - Additional HTML attributes
-     * @returns {string} HTML string
-     */
     createInput(config) {
+      const focusColor = config.focusColor || "#3b82f6";
+      const focusShadow = Utils.hexToRgba(focusColor, 0.1);
+
       return `
         <div style="margin-bottom: 20px;">
-          <label style="${STYLES.label}">${config.label}</label>
+          <label for="${Utils.escapeAttr(config.id)}" style="${STYLES.label}">
+            ${Utils.escapeHTML(config.label)}
+          </label>
           <input
-            type="${config.type || "text"}"
-            id="${config.id}"
-            value="${config.value || ""}"
-            placeholder="${config.placeholder || ""}"
+            type="${Utils.escapeAttr(config.type || "text")}"
+            id="${Utils.escapeAttr(config.id)}"
+            value="${Utils.escapeAttr(config.value || "")}"
+            placeholder="${Utils.escapeAttr(config.placeholder || "")}"
             style="${STYLES.input}"
-            onfocus="this.style.borderColor='${
-              config.focusColor || "#3b82f6"
-            }'; this.style.boxShadow='0 0 0 3px ${
-        config.focusColor
-          ? config.focusColor.replace("#", "rgba(") + ", 0.1)'"
-          : "rgba(59,130,246,0.1)'"
-      }"
-            onblur="this.style.borderColor='#e5e7eb'; this.style.boxShadow='none'"
+            data-focus-color="${Utils.escapeAttr(focusColor)}"
+            data-focus-shadow="${Utils.escapeAttr(focusShadow)}"
             ${config.attrs || ""}
           />
         </div>
       `;
     },
 
-    /**
-     * Create button component
-     * @param {Object} config - Button configuration
-     * @param {string} config.id - Button element ID
-     * @param {string} config.text - Button text
-     * @param {string} config.type - Button type (cancel|primary|success)
-     * @param {string} config.icon - Icon HTML (optional)
-     * @returns {string} HTML string
-     */
     createButton(config) {
       const typeStyles = {
         cancel: STYLES.buttonCancel,
@@ -523,45 +545,27 @@
         success: STYLES.buttonSuccess,
       };
 
-      const hoverEffects = {
-        cancel:
-          "onmouseover=\"this.style.background='#f9fafb'; this.style.borderColor='#d1d5db'\" onmouseout=\"this.style.background='white'; this.style.borderColor='#e5e7eb'\"",
-        primary:
-          "onmouseover=\"this.style.transform='translateY(-1px)'; this.style.boxShadow='0 4px 12px rgba(59,130,246,0.4)'\" onmouseout=\"this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(59,130,246,0.3)'\"",
-        success:
-          "onmouseover=\"this.style.transform='translateY(-1px)'; this.style.boxShadow='0 4px 12px rgba(245,158,11,0.4)'\" onmouseout=\"this.style.transform='translateY(0)'; this.style.boxShadow='0 2px 8px rgba(245,158,11,0.3)'\"",
-      };
-
-      const iconHtml = config.icon ? `<span>${config.icon}</span>` : "";
+      const iconHtml = config.icon
+        ? `<span>${Utils.escapeHTML(config.icon)}</span>`
+        : "";
       const displayStyle = config.icon
         ? "display: inline-flex; align-items: center; gap: 6px;"
         : "";
+      const type = typeStyles[config.type] ? config.type : "primary";
 
       return `
         <button
-          id="${config.id}"
-          style="${STYLES.buttonBase} ${
-        typeStyles[config.type]
-      } ${displayStyle}"
-          ${hoverEffects[config.type]}
+          type="button"
+          id="${Utils.escapeAttr(config.id)}"
+          data-reward-button-type="${Utils.escapeAttr(type)}"
+          style="${STYLES.buttonBase} ${typeStyles[type]} ${displayStyle}"
         >
           ${iconHtml}
-          <span>${config.text}</span>
+          <span>${Utils.escapeHTML(config.text)}</span>
         </button>
       `;
     },
 
-    /**
-     * Create info box component
-     * @param {Object} config - Info box configuration
-     * @param {string} config.type - Box type (warning|info)
-     * @param {string} config.icon - Icon emoji
-     * @param {string} config.title - Title text (optional)
-     * @param {string} config.content - Content text
-     * @param {string} config.linkUrl - Link URL (optional)
-     * @param {string} config.linkText - Link text (optional)
-     * @returns {string} HTML string
-     */
     createInfoBox(config) {
       const boxStyles = {
         warning: STYLES.warningBox,
@@ -581,11 +585,17 @@
       const titleHtml = config.title
         ? `<div style="font-weight: 600; color: ${
             titleColor[config.type]
-          }; margin-bottom: 4px; font-size: 14px;">${config.title}</div>`
+          }; margin-bottom: 4px; font-size: 14px;">${Utils.escapeHTML(
+            config.title
+          )}</div>`
         : "";
 
       const linkHtml = config.linkUrl
-        ? `<a href="${config.linkUrl}" target="_blank" style="color: #2563eb; text-decoration: none; font-weight: 500; font-size: 13px; display: inline-flex; align-items: center; gap: 4px;">${config.linkText} →</a>`
+        ? `<a href="${Utils.escapeAttr(
+            config.linkUrl
+          )}" target="_blank" rel="noopener noreferrer" style="color: #2563eb; text-decoration: none; font-weight: 500; font-size: 13px; display: inline-flex; align-items: center; gap: 4px;">${Utils.escapeHTML(
+            config.linkText
+          )} -></a>`
         : "";
 
       return `
@@ -593,7 +603,7 @@
           <div style="display: flex; align-items: start; gap: 8px;">
             <span style="font-size: ${
               config.type === "warning" ? "16px" : "18px"
-            };">${config.icon}</span>
+            };">${Utils.escapeHTML(config.icon)}</span>
             <div style="flex: 1;">
               ${titleHtml}
               <div style="color: ${
@@ -608,38 +618,83 @@
       `;
     },
 
-    /**
-     * Create user info card
-     * @param {string} userId - User ID
-     * @param {string} username - Username
-     * @param {string} avatarUrl - Avatar URL
-     * @param {string} fullName - Full name or nickname
-     * @returns {string} HTML string
-     */
     createUserCard(userId, username, avatarUrl, fullName) {
+      const safeAvatarUrl = Utils.sanitizeUrl(avatarUrl);
       return `
         <div style="display: flex; align-items: center; margin-bottom: 24px; padding: 16px; background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); border-radius: 10px; border: 1px solid #e5e7eb;">
-          <img src="${avatarUrl}" style="width: 56px; height: 56px; border-radius: 50%; margin-right: 14px; border: 2px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" />
+          <img src="${Utils.escapeAttr(
+            safeAvatarUrl
+          )}" alt="" style="width: 56px; height: 56px; border-radius: 50%; margin-right: 14px; border: 2px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" />
           <div style="flex: 1;">
-            <div style="font-weight: 600; color: #1a1a1a; font-size: 17px; margin-bottom: 3px;">${fullName}</div>
-            <div style="font-size: 13px; color: #6b7280; margin-bottom: 2px;">@${username}</div>
-            <div style="font-size: 12px; color: #9ca3af;">User ID: ${userId}</div>
+            <div style="font-weight: 600; color: #1a1a1a; font-size: 17px; margin-bottom: 3px;">${Utils.escapeHTML(
+              fullName
+            )}</div>
+            <div style="font-size: 13px; color: #6b7280; margin-bottom: 2px;">@${Utils.escapeHTML(
+              username
+            )}</div>
+            <div style="font-size: 12px; color: #9ca3af;">User ID: ${Utils.escapeHTML(
+              userId
+            )}</div>
           </div>
         </div>
       `;
     },
+
+    bindInteractiveStyles(root) {
+      root.querySelectorAll("input[data-focus-color]").forEach((input) => {
+        input.addEventListener("focus", () => {
+          input.style.borderColor = input.dataset.focusColor || "#3b82f6";
+          input.style.boxShadow =
+            `0 0 0 3px ${input.dataset.focusShadow}` ||
+            "0 0 0 3px rgba(59,130,246,0.1)";
+        });
+
+        input.addEventListener("blur", () => {
+          input.style.borderColor = "#e5e7eb";
+          input.style.boxShadow = "none";
+        });
+      });
+
+      root
+        .querySelectorAll("button[data-reward-button-type]")
+        .forEach((button) => {
+          const type = button.dataset.rewardButtonType;
+          button.addEventListener("mouseenter", () => {
+            if (button.disabled) {
+              return;
+            }
+
+            if (type === "cancel") {
+              button.style.background = "#f9fafb";
+              button.style.borderColor = "#d1d5db";
+            } else if (type === "success") {
+              button.style.transform = "translateY(-1px)";
+              button.style.boxShadow = "0 4px 12px rgba(245,158,11,0.4)";
+            } else {
+              button.style.transform = "translateY(-1px)";
+              button.style.boxShadow = "0 4px 12px rgba(59,130,246,0.4)";
+            }
+          });
+
+          button.addEventListener("mouseleave", () => {
+            if (type === "cancel") {
+              button.style.background = "white";
+              button.style.borderColor = "#e5e7eb";
+            } else if (type === "success") {
+              button.style.transform = "translateY(0)";
+              button.style.boxShadow = "0 2px 8px rgba(245,158,11,0.3)";
+            } else {
+              button.style.transform = "translateY(0)";
+              button.style.boxShadow = "0 2px 8px rgba(59,130,246,0.3)";
+            }
+          });
+        });
+    },
   };
 
-  // ============================================================================
-  // UIManager Module - Manage dialogs and UI interactions
-  // ============================================================================
-
   const UIManager = {
-    /**
-     * Show configuration dialog
-     */
     showConfigDialog() {
-      const config = ConfigManager.get();
+      const config = ConfigManager.get() || {};
 
       const content = `
         <h2 style="margin: 0 0 24px 0; color: #1a1a1a; font-size: 24px; font-weight: 600;">Linux.do 打赏配置</h2>
@@ -648,7 +703,7 @@
           id: "reward-client-id",
           label: "Client ID:",
           placeholder: "请输入 Client ID",
-          value: config?.client_id || "",
+          value: config.client_id || "",
         })}
 
         ${UIComponents.createInput({
@@ -656,24 +711,24 @@
           label: "Client Secret:",
           type: "password",
           placeholder: "请输入 Client Secret",
-          value: config?.client_secret || "",
+          value: config.client_secret || "",
         })}
 
         ${UIComponents.createInfoBox({
           type: "info",
-          icon: "📖",
-          title: "如何获取凭证？",
+          icon: "i",
+          title: "凭证方式",
           content:
-            "请访问 Linux.do 商户后台获取您的 Client ID 和 Client Secret",
+            "请填写 Linux.do Credit 商户后台中的 Client ID 和 Client Secret。脚本会自动生成 Authorization Basic 请求头。",
           linkUrl: CONFIG.API.DOCS_URL,
-          linkText: "点击前往文档",
+          linkText: "打开文档",
         })}
 
         ${UIComponents.createInfoBox({
           type: "warning",
-          icon: "⚠️",
+          icon: "!",
           content:
-            "<strong>安全提示：</strong>请妥善保管您的凭证，不要泄露给他人",
+            "<strong>安全提示：</strong>Client Secret 和 Cookie 都是敏感凭证。脚本不会保存 Cookie。",
         })}
 
         <div style="display: flex; gap: 12px; justify-content: flex-end;">
@@ -690,43 +745,55 @@
         </div>
       `;
 
-      const overlay = UIComponents.createOverlay(content, "480px");
+      const overlay = UIComponents.createOverlay(content, "520px");
       document.body.appendChild(overlay);
+      UIComponents.bindInteractiveStyles(overlay);
 
-      // Cancel button
-      overlay.querySelector("#reward-config-cancel").onclick = () => {
-        overlay.remove();
-      };
+      overlay
+        .querySelector("#reward-config-cancel")
+        .addEventListener("click", () => {
+          overlay.remove();
+        });
 
-      // Save button
-      overlay.querySelector("#reward-config-save").onclick = () => {
-        const clientId = overlay
-          .querySelector("#reward-client-id")
-          .value.trim();
-        const clientSecret = overlay
-          .querySelector("#reward-client-secret")
-          .value.trim();
+      overlay
+        .querySelector("#reward-config-save")
+        .addEventListener("click", () => {
+          const clientId = overlay
+            .querySelector("#reward-client-id")
+            .value.trim();
+          const clientSecret = overlay
+            .querySelector("#reward-client-secret")
+            .value.trim();
 
-        if (!clientId || !clientSecret) {
-          alert("请填写完整的 Client ID 和 Client Secret");
-          return;
-        }
+          if (!clientId || !clientSecret) {
+            alert("请填写 Client ID 和 Client Secret");
+            return;
+          }
 
-        ConfigManager.save(clientId, clientSecret);
-        overlay.remove();
-      };
+          ConfigManager.save(clientId, clientSecret);
+          overlay.remove();
+        });
     },
 
-    /**
-     * Show reward dialog
-     * @param {string} userId - Target user ID
-     * @param {string} username - Target username
-     * @param {string} avatarUrl - Target user avatar URL
-     * @param {string} fullName - Target user full name or nickname
-     * @param {string} topicId - Topic ID
-     * @param {string} postId - Post ID
-     */
     showRewardDialog(userId, username, avatarUrl, fullName, topicId, postId) {
+      const quickAmountButtons = CONFIG.QUICK_AMOUNTS.map(
+        (amount) => `
+          <button class="quick-amount-btn" type="button" data-amount="${Utils.escapeAttr(
+            amount
+          )}" style="
+            padding: 12px;
+            border: 2px solid #e5e7eb;
+            background: white;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 14px;
+            color: #374151;
+            transition: all 0.2s;
+          ">${Utils.escapeHTML(amount)} LDC</button>
+        `
+      ).join("");
+
       const content = `
         <h2 style="margin: 0 0 24px 0; color: #1a1a1a; font-size: 24px; font-weight: 600;">打赏</h2>
 
@@ -735,21 +802,7 @@
         <div style="margin-bottom: 20px;">
           <label style="${STYLES.label}">快捷金额：</label>
           <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
-            ${CONFIG.QUICK_AMOUNTS.map(
-              (amount) => `
-              <button class="quick-amount-btn" data-amount="${amount}" style="
-                padding: 12px;
-                border: 2px solid #e5e7eb;
-                background: white;
-                border-radius: 8px;
-                cursor: pointer;
-                font-weight: 600;
-                font-size: 14px;
-                color: #374151;
-                transition: all 0.2s;
-              ">${amount} LDC</button>
-            `
-            ).join("")}
+            ${quickAmountButtons}
           </div>
         </div>
 
@@ -779,47 +832,42 @@
             id: "reward-confirm",
             text: "确认打赏",
             type: "success",
-            icon: "💰",
+            icon: "$",
           })}
         </div>
       `;
 
       const overlay = UIComponents.createOverlay(content, "440px");
       document.body.appendChild(overlay);
+      UIComponents.bindInteractiveStyles(overlay);
 
       const amountInput = overlay.querySelector("#reward-amount");
       const remarkInput = overlay.querySelector("#reward-remark");
 
-      // Quick amount buttons
-      overlay.querySelectorAll(".quick-amount-btn").forEach((btn) => {
-        btn.onclick = function () {
-          // Reset all buttons
-          overlay.querySelectorAll(".quick-amount-btn").forEach((b) => {
-            b.style.borderColor = "#e5e7eb";
-            b.style.background = "white";
-            b.style.color = "#374151";
+      overlay.querySelectorAll(".quick-amount-btn").forEach((button) => {
+        button.addEventListener("click", () => {
+          overlay.querySelectorAll(".quick-amount-btn").forEach((item) => {
+            item.style.borderColor = "#e5e7eb";
+            item.style.background = "white";
+            item.style.color = "#374151";
           });
-          // Highlight selected button
-          this.style.borderColor = "#f59e0b";
-          this.style.background = "#fef3c7";
-          this.style.color = "#92400e";
-          // Set amount
-          amountInput.value = this.dataset.amount;
-        };
+
+          button.style.borderColor = "#f59e0b";
+          button.style.background = "#fef3c7";
+          button.style.color = "#92400e";
+          amountInput.value = button.dataset.amount;
+        });
       });
 
-      // Cancel button
-      overlay.querySelector("#reward-cancel").onclick = () => {
+      overlay.querySelector("#reward-cancel").addEventListener("click", () => {
         overlay.remove();
-      };
+      });
 
-      // Confirm button
-      overlay.querySelector("#reward-confirm").onclick = () => {
-        const amount = parseFloat(amountInput.value);
+      overlay.querySelector("#reward-confirm").addEventListener("click", () => {
+        const amount = Number.parseFloat(amountInput.value);
 
-        // Validation
-        if (!amount || amount <= 0) {
-          alert("请输入有效的打赏金额");
+        if (!Number.isFinite(amount) || amount < CONFIG.AMOUNT.MIN) {
+          alert(`请输入不小于 ${CONFIG.AMOUNT.MIN} 的打赏金额`);
           return;
         }
 
@@ -828,28 +876,20 @@
           return;
         }
 
-        // Double confirmation
-        if (
-          !confirm(`确认向 ${fullName} (@${username}) 打赏 ${amount} LDC？`)
-        ) {
+        if (!confirm(`确认向 ${fullName} (@${username}) 打赏 ${amount} LDC？`)) {
           return;
         }
 
-        // Disable button to prevent duplicate clicks
-        const confirmBtn = overlay.querySelector("#reward-confirm");
-        confirmBtn.disabled = true;
-        confirmBtn.textContent = "打赏中...";
-        confirmBtn.style.background = "#ccc";
+        const confirmButton = overlay.querySelector("#reward-confirm");
+        confirmButton.disabled = true;
+        confirmButton.textContent = "打赏中...";
+        confirmButton.style.background = "#ccc";
 
-        // Build remark - only use user's message
-        let remark = remarkInput.value.trim();
-        if (remark) {
-          remark = `${remark} by @T佬的打赏插件`;
-        } else {
-          remark = "打赏 by @T佬的打赏插件";
-        }
+        const userRemark = remarkInput.value.trim();
+        const remark = userRemark
+          ? `${userRemark} by @T佬的打赏插件`
+          : "打赏 by @T佬的打赏插件";
 
-        // Send reward
         RewardAPI.sendReward(
           userId,
           username,
@@ -860,145 +900,133 @@
           (success, message) => {
             overlay.remove();
             if (success) {
-              alert(`✅ 打赏成功！`);
+              alert("打赏成功！");
             } else {
-              alert(`❌ 打赏失败\n\n${message}`);
+              alert(`打赏失败\n\n${message}`);
             }
           }
         );
-      };
+      });
     },
   };
 
-  // ============================================================================
-  // DOMManager Module - Handle DOM operations and button injection
-  // ============================================================================
-
-  /**
-   * Current URL for tracking route changes
-   */
   let currentUrl = location.href;
-
-  /**
-   * Debounce timer
-   */
   let debounceTimer = null;
 
   const DOMManager = {
-    /**
-     * Add reward buttons to all posts
-     */
     addRewardButtons() {
-      // 1. 仅在帖子详情页执行
       if (!Utils.isTopicPage()) {
         return;
       }
 
-      // 2. 获取所有帖子元素
-      const articles = document.querySelectorAll(CONFIG.SELECTORS.ARTICLE);
-
-      articles.forEach((article) => {
-        // --- 核心修复：更严格的检查逻辑 ---
-
-        // 找到操作栏容器
-        const controls = article.querySelector(CONFIG.SELECTORS.CONTROLS);
-        if (!controls) {
-          return;
-        }
-
-        // 检查 1: 如果容器里已经有打赏按钮了，直接跳过 (防止重复)
-        if (controls.querySelector(CONFIG.SELECTORS.REWARD_BUTTON)) {
-          return;
-        }
-
-        // 检查 2: 如果找不到点赞按钮，说明可能是系统消息或特殊帖子，跳过
-        const likeButton = article.querySelector(CONFIG.SELECTORS.LIKE_BUTTON);
-        if (!likeButton) {
-          return;
-        }
-        const userId = article.getAttribute("data-user-id");
-        const usernameElement = article.querySelector(
-          CONFIG.SELECTORS.USER_CARD
-        );
-        const username = usernameElement?.getAttribute("data-user-card");
-        const avatarElement = article.querySelector(CONFIG.SELECTORS.AVATAR);
-        const avatarUrl = avatarElement?.src;
-
-        // Get full name (prefer display name, fallback to username)
-        const fullNameElement = article.querySelector(
-          CONFIG.SELECTORS.FULL_NAME
-        );
-        const fullName = fullNameElement?.textContent?.trim() || username;
-
-        // Get topic ID and post ID
-        const topicId = Utils.getTopicId();
-        const postId = Utils.getPostId(article);
-
-        if (!userId || !username || !topicId || !postId) {
-          return;
-        }
-
-        // Create reward button
-        const rewardBtn = document.createElement("button");
-        rewardBtn.className = "reward-button btn btn-icon-text btn-flat";
-        rewardBtn.innerHTML = `
-            <svg class="fa d-icon d-icon-coins svg-icon svg-string" style="width: 16px; height: 16px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-              <path fill="currentColor" d="M512 80c0 18-14.3 34.6-38.4 48c-29.1 16.1-72.5 27.5-122.3 30.9c-3.7-1.8-7.4-3.5-11.3-5C300.6 137.4 248.2 128 192 128c-8.3 0-16.4 .2-24.5 .6l-1.1-.6C142.3 114.6 128 98 128 80c0-44.2 86-80 192-80S512 35.8 512 80zM160.7 161.1c10.2-.7 20.7-1.1 31.3-1.1c62.2 0 117.4 12.3 152.5 31.4C369.3 204.9 384 221.7 384 240c0 4-.7 7.9-2.1 11.7c-4.6 13.2-17 25.3-35 35.5c0 0 0 0 0 0c-.1 .1-.3 .1-.4 .2l0 0 0 0c-.3 .2-.6 .3-.9 .5c-35 19.4-90.8 32-153.6 32c-59.6 0-112.9-11.3-148.2-29.1c-1.9-.9-3.7-1.9-5.5-2.9C14.3 274.6 0 258 0 240c0-34.8 53.4-64.5 128-75.4c10.5-1.5 21.4-2.7 32.7-3.5zM416 240c0-21.9-10.6-39.9-24.1-53.4c28.3-4.4 54.2-11.4 76.2-20.5c16.3-6.8 31.5-15.2 43.9-25.5V176c0 19.3-16.5 37.1-43.8 50.9c-14.6 7.4-32.4 13.7-52.4 18.5c.1-1.8 .2-3.5 .2-5.3zm-32 96c0 18-14.3 34.6-38.4 48c-1.8 1-3.6 1.9-5.5 2.9C304.9 404.7 251.6 416 192 416c-62.8 0-118.6-12.6-153.6-32C14.3 370.6 0 354 0 336V300.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 342.6 135.8 352 192 352s108.6-9.4 148.1-25.9c7.8-3.2 15.3-6.9 22.4-10.9c6.1-3.4 11.8-7.2 17.2-11.2c1.5-1.1 2.9-2.3 4.3-3.4V304v5.7V336zm32 0V304 278.1c19-4.2 36.5-9.5 52.1-16c16.3-6.8 31.5-15.2 43.9-25.5V272c0 10.5-5 21-14.9 30.9c-16.3 16.3-45 29.7-81.3 38.4c.1-1.7 .2-3.5 .2-5.3zM192 448c56.2 0 108.6-9.4 148.1-25.9c16.3-6.8 31.5-15.2 43.9-25.5V432c0 44.2-86 80-192 80S0 476.2 0 432V396.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 438.6 135.8 448 192 448z"/>
-        </svg>
-        <span class="d-button-label">打赏</span>
-        `;
-        rewardBtn.style.cssText = `
-          color: #f59e0b;
-          margin-left: 5px;
-          display: flex; /* 确保图标对齐 */
-          align-items: center;
-        `;
-        rewardBtn.title = `打赏 ${fullName}`;
-
-        rewardBtn.onclick = (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const config = ConfigManager.get();
-          if (!config) {
-            if (confirm("您还未配置打赏凭证，是否现在配置？")) {
-              UIManager.showConfigDialog();
-            }
-            return;
-          }
-          UIManager.showRewardDialog(
-            userId,
-            username,
-            avatarUrl,
-            fullName,
-            topicId,
-            postId
-          );
-        };
-
-        // 插入按钮到第一个位置
-        controls.insertBefore(rewardBtn, controls.firstChild);
-      });
+      const articles = Array.from(
+        document.querySelectorAll(CONFIG.SELECTORS.ARTICLE)
+      );
+      this.processArticlesInBatches(articles);
     },
 
-    /**
-     * Debounced version of addRewardButtons
-     */
+    processArticlesInBatches(articles) {
+      let index = 0;
+
+      const processBatch = () => {
+        const end = Math.min(
+          index + CONFIG.PERFORMANCE.BATCH_SIZE,
+          articles.length
+        );
+
+        for (; index < end; index += 1) {
+          this.processArticle(articles[index]);
+        }
+
+        if (index < articles.length) {
+          requestAnimationFrame(processBatch);
+        }
+      };
+
+      processBatch();
+    },
+
+    processArticle(article) {
+      const controls = article.querySelector(CONFIG.SELECTORS.CONTROLS);
+      if (!controls) {
+        return;
+      }
+
+      if (controls.querySelector(CONFIG.SELECTORS.REWARD_BUTTON)) {
+        return;
+      }
+
+      const likeButton = article.querySelector(CONFIG.SELECTORS.LIKE_BUTTON);
+      if (!likeButton) {
+        return;
+      }
+
+      const userId = article.getAttribute("data-user-id");
+      const usernameElement = article.querySelector(CONFIG.SELECTORS.USER_CARD);
+      const username = usernameElement?.getAttribute("data-user-card");
+      const avatarElement = article.querySelector(CONFIG.SELECTORS.AVATAR);
+      const avatarUrl = avatarElement?.src || "";
+      const fullNameElement = article.querySelector(CONFIG.SELECTORS.FULL_NAME);
+      const fullName = fullNameElement?.textContent?.trim() || username;
+      const topicId = Utils.getTopicId();
+      const postId = Utils.getPostId(article);
+
+      if (!userId || !username || !topicId || !postId) {
+        return;
+      }
+
+      const rewardButton = document.createElement("button");
+      rewardButton.type = "button";
+      rewardButton.className = "reward-button btn btn-icon-text btn-flat";
+      rewardButton.innerHTML = `
+        <svg class="fa d-icon d-icon-coins svg-icon svg-string" style="width: 16px; height: 16px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-hidden="true">
+          <path fill="currentColor" d="M512 80c0 18-14.3 34.6-38.4 48c-29.1 16.1-72.5 27.5-122.3 30.9c-3.7-1.8-7.4-3.5-11.3-5C300.6 137.4 248.2 128 192 128c-8.3 0-16.4 .2-24.5 .6l-1.1-.6C142.3 114.6 128 98 128 80c0-44.2 86-80 192-80S512 35.8 512 80zM160.7 161.1c10.2-.7 20.7-1.1 31.3-1.1c62.2 0 117.4 12.3 152.5 31.4C369.3 204.9 384 221.7 384 240c0 4-.7 7.9-2.1 11.7c-4.6 13.2-17 25.3-35 35.5c0 0 0 0 0 0c-.1 .1-.3 .1-.4 .2l0 0 0 0c-.3 .2-.6 .3-.9 .5c-35 19.4-90.8 32-153.6 32c-59.6 0-112.9-11.3-148.2-29.1c-1.9-.9-3.7-1.9-5.5-2.9C14.3 274.6 0 258 0 240c0-34.8 53.4-64.5 128-75.4c10.5-1.5 21.4-2.7 32.7-3.5zM416 240c0-21.9-10.6-39.9-24.1-53.4c28.3-4.4 54.2-11.4 76.2-20.5c16.3-6.8 31.5-15.2 43.9-25.5V176c0 19.3-16.5 37.1-43.8 50.9c-14.6 7.4-32.4 13.7-52.4 18.5c.1-1.8 .2-3.5 .2-5.3zm-32 96c0 18-14.3 34.6-38.4 48c-1.8 1-3.6 1.9-5.5 2.9C304.9 404.7 251.6 416 192 416c-62.8 0-118.6-12.6-153.6-32C14.3 370.6 0 354 0 336V300.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 342.6 135.8 352 192 352s108.6-9.4 148.1-25.9c7.8-3.2 15.3-6.9 22.4-10.9c6.1-3.4 11.8-7.2 17.2-11.2c1.5-1.1 2.9-2.3 4.3-3.4V304v5.7V336zm32 0V304 278.1c19-4.2 36.5-9.5 52.1-16c16.3-6.8 31.5-15.2 43.9-25.5V272c0 10.5-5 21-14.9 30.9c-16.3 16.3-45 29.7-81.3 38.4c.1-1.7 .2-3.5 .2-5.3zM192 448c56.2 0 108.6-9.4 148.1-25.9c16.3-6.8 31.5-15.2 43.9-25.5V432c0 44.2-86 80-192 80S0 476.2 0 432V396.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 438.6 135.8 448 192 448z"/>
+        </svg>
+        <span class="d-button-label">打赏</span>
+      `;
+      rewardButton.style.cssText = `
+        color: #f59e0b;
+        margin-left: 5px;
+        display: flex;
+        align-items: center;
+      `;
+      rewardButton.title = `打赏 ${fullName}`;
+
+      rewardButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (!ConfigManager.isConfigured()) {
+          if (confirm("您还未配置打赏凭证，是否现在配置？")) {
+            UIManager.showConfigDialog();
+          }
+          return;
+        }
+
+        UIManager.showRewardDialog(
+          userId,
+          username,
+          avatarUrl,
+          fullName,
+          topicId,
+          postId
+        );
+      });
+
+      controls.insertBefore(rewardButton, controls.firstChild);
+    },
+
     debouncedAddRewardButtons() {
       clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        this.addRewardButtons();
+        DOMManager.addRewardButtons();
       }, CONFIG.TIMING.DEBOUNCE_DELAY);
     },
 
-    /**
-     * Watch for URL changes (for SPA routing)
-     */
     watchUrlChange() {
       setInterval(() => {
         if (currentUrl !== location.href) {
           currentUrl = location.href;
-
-          // Delay to wait for page rendering
           setTimeout(() => {
             DOMManager.addRewardButtons();
           }, CONFIG.TIMING.ROUTE_CHANGE_DELAY);
@@ -1007,30 +1035,19 @@
     },
   };
 
-  // ============================================================================
-  // Initialization
-  // ============================================================================
-
-  /**
-   * Initialize the reward assistant
-   */
   function init() {
-    console.log("[打赏助手] 初始化");
+    Utils.debug("初始化");
 
-    // Check and prompt for config on first use
     ConfigManager.checkAndPrompt();
 
-    // Add buttons immediately on topic pages
     if (Utils.isTopicPage()) {
       setTimeout(() => {
         DOMManager.addRewardButtons();
       }, CONFIG.TIMING.INITIAL_LOAD_DELAY);
     }
 
-    // Watch for URL changes (SPA routing)
     DOMManager.watchUrlChange();
 
-    // Watch for dynamic content loading
     const observer = new MutationObserver(() => {
       DOMManager.debouncedAddRewardButtons();
     });
@@ -1041,16 +1058,10 @@
     });
   }
 
-  // ============================================================================
-  // Bootstrap
-  // ============================================================================
-
-  // Register menu command
   GM_registerMenuCommand("配置打赏凭证", () => {
     UIManager.showConfigDialog();
   });
 
-  // Start when page is ready
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {
