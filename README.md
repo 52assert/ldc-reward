@@ -6,7 +6,7 @@
 
 ## 安装
 
-发布到 Greasy Fork 后，可在这里补充安装地址。
+[点击安装 Greasy Fork 版本](https://greasyfork.org/en/scripts/579871-linuxdo-%E6%89%93%E8%B5%8F%E5%8A%A9%E6%89%8B)
 
 也可以手动安装：
 
