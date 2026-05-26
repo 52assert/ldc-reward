@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         LINUXDO 打赏助手
 // @namespace    dream.linuxdo.reward.ldc
-// @version      1.0.6
-// @description  为 Linux.do 社区帖子添加 LDC 打赏按钮，适配 credit.linux.do 新版 lpay/distribute 接口，并修复严格 CSP 下的内联事件报错。
+// @version      1.0.8
+// @description  为 Linux.do 社区帖子和用户资料页添加 LDC 打赏按钮，适配 credit.linux.do 新版 lpay/distribute 接口，并修复严格 CSP 下的内联事件报错。
 // @author       dream
 // @match        https://linux.do/*
 // @grant        GM_setValue
@@ -49,9 +49,7 @@
       CREDIT_ORIGIN: "https://credit.linux.do",
       CREDIT_REFERER: "https://credit.linux.do/merchant",
 
-      // false 更贴近你抓到的 curl：只发送 user_id / username / amount。
-      // 如果你确认服务端接受 remark/out_trade_no，可以改成 true。
-      INCLUDE_OPTIONAL_FIELDS: false,
+      INCLUDE_OPTIONAL_FIELDS: true,
       TRY_SPOOF_CREDIT_HEADERS: true,
       DEBUG: true,
     },
@@ -64,10 +62,18 @@
       FULL_NAME: ".names .first.full-name a",
       CONTROLS: ".post-controls .actions",
       REWARD_BUTTON: ".reward-button",
+      PROFILE_PRIMARY: "#main-outlet .details > .primary",
+      PROFILE_CONTROLS: "section.controls > ul",
+      PROFILE_USERNAME:
+        ".user-profile-names .username, .user-profile-names__secondary",
+      PROFILE_FULL_NAME:
+        ".user-profile-names .full-name, .user-profile-names__primary",
+      PROFILE_AVATAR: ".user-profile-avatar img.avatar, .user-profile-avatar img",
     },
 
     REGEX: {
       TOPIC_PAGE: /^https:\/\/linux\.do\/t\/topic\/\d+/,
+      USER_PROFILE_PAGE: /^\/u\/[^/]+(?:\/summary)?\/?$/,
     },
   };
 
@@ -168,12 +174,21 @@
   };
 
   const Utils = {
-    generateTradeNo(topicId, postId) {
+    generateTradeNo(context) {
       const timestamp = Date.now();
-      const random = Math.floor(Math.random() * 10000)
+      const random = Math.floor(Math.random() * 1000000)
         .toString()
-        .padStart(4, "0");
-      return `LDR_T${topicId}_P${postId}_${timestamp}_${random}`;
+        .padStart(6, "0");
+
+      if (context?.type === "profile" && context.userId) {
+        return `LDR-U${context.userId}-${timestamp}-${random}`;
+      }
+
+      if (context?.topicId && context?.postId) {
+        return `LDR-T${context.topicId}-P${context.postId}-${timestamp}-${random}`;
+      }
+
+      return `LDR-${timestamp}-${random}`;
     },
 
     getTopicId() {
@@ -193,6 +208,19 @@
 
     isTopicPage() {
       return CONFIG.REGEX.TOPIC_PAGE.test(location.href);
+    },
+
+    isUserProfilePage() {
+      return CONFIG.REGEX.USER_PROFILE_PAGE.test(location.pathname);
+    },
+
+    isRewardSupportedPage() {
+      return this.isTopicPage() || this.isUserProfilePage();
+    },
+
+    getProfileUsernameFromPath() {
+      const match = location.pathname.match(/^\/u\/([^/]+)(?:\/summary)?\/?$/);
+      return match ? decodeURIComponent(match[1]) : null;
     },
 
     handleError(type, details) {
@@ -306,6 +334,7 @@
   };
 
   const pendingRewards = new Map();
+  const profileUserCache = new Map();
 
   function cleanupExpiredPendingRewards() {
     const now = Date.now();
@@ -396,7 +425,12 @@
         return;
       }
 
-      const tradeNo = Utils.generateTradeNo(topicId, postId);
+      const tradeNo = Utils.generateTradeNo({
+        type: postId === "profile" ? "profile" : "topic",
+        topicId,
+        postId,
+        userId: parsedUserId,
+      });
       const payload = {
         user_id: parsedUserId,
         username,
@@ -493,6 +527,64 @@
         Utils.handleError(ErrorTypes.NETWORK_ERROR, error);
         callback(false, `请求发起失败：${error?.message || error}`);
       }
+    },
+  };
+
+  const ProfileAPI = {
+    buildAvatarUrl(avatarTemplate) {
+      if (!avatarTemplate) {
+        return "";
+      }
+
+      try {
+        const avatarPath = String(avatarTemplate).replace("{size}", "144");
+        return new URL(avatarPath, location.origin).href;
+      } catch (error) {
+        Utils.handleError(ErrorTypes.VALIDATION_ERROR, error);
+        return "";
+      }
+    },
+
+    async fetchUser(username) {
+      const normalizedUsername = String(username || "").trim();
+      if (!normalizedUsername) {
+        throw new Error("缺少用户名");
+      }
+
+      const cacheKey = normalizedUsername.toLowerCase();
+      if (profileUserCache.has(cacheKey)) {
+        return profileUserCache.get(cacheKey);
+      }
+
+      const response = await fetch(
+        `/u/${encodeURIComponent(normalizedUsername)}.json`,
+        {
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json",
+          },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`用户信息请求失败：HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      const user = data?.user;
+      if (!user?.id) {
+        throw new Error("用户信息中缺少 user_id");
+      }
+
+      const profileUser = {
+        userId: user.id,
+        username: user.username || normalizedUsername,
+        fullName: user.name || user.username || normalizedUsername,
+        avatarUrl: this.buildAvatarUrl(user.avatar_template),
+      };
+
+      profileUserCache.set(cacheKey, profileUser);
+      return profileUser;
     },
   };
 
@@ -886,9 +978,10 @@
         confirmButton.style.background = "#ccc";
 
         const userRemark = remarkInput.value.trim();
+        const rewardTarget = `给 @${username} 打赏`;
         const remark = userRemark
-          ? `${userRemark} by @T佬的打赏插件`
-          : "打赏 by @T佬的打赏插件";
+          ? `${userRemark} - ${rewardTarget}`
+          : rewardTarget;
 
         RewardAPI.sendReward(
           userId,
@@ -915,14 +1008,16 @@
 
   const DOMManager = {
     addRewardButtons() {
-      if (!Utils.isTopicPage()) {
-        return;
+      if (Utils.isTopicPage()) {
+        const articles = Array.from(
+          document.querySelectorAll(CONFIG.SELECTORS.ARTICLE)
+        );
+        this.processArticlesInBatches(articles);
       }
 
-      const articles = Array.from(
-        document.querySelectorAll(CONFIG.SELECTORS.ARTICLE)
-      );
-      this.processArticlesInBatches(articles);
+      if (Utils.isUserProfilePage()) {
+        this.addUserProfileRewardButton();
+      }
     },
 
     processArticlesInBatches(articles) {
@@ -944,6 +1039,45 @@
       };
 
       processBatch();
+    },
+
+    createRewardButton(className, extraStyle = "") {
+      const rewardButton = document.createElement("button");
+      rewardButton.type = "button";
+      rewardButton.className = className;
+      rewardButton.innerHTML = `
+        <svg class="fa d-icon d-icon-coins svg-icon svg-string" style="width: 16px; height: 16px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-hidden="true">
+          <path fill="currentColor" d="M512 80c0 18-14.3 34.6-38.4 48c-29.1 16.1-72.5 27.5-122.3 30.9c-3.7-1.8-7.4-3.5-11.3-5C300.6 137.4 248.2 128 192 128c-8.3 0-16.4 .2-24.5 .6l-1.1-.6C142.3 114.6 128 98 128 80c0-44.2 86-80 192-80S512 35.8 512 80zM160.7 161.1c10.2-.7 20.7-1.1 31.3-1.1c62.2 0 117.4 12.3 152.5 31.4C369.3 204.9 384 221.7 384 240c0 4-.7 7.9-2.1 11.7c-4.6 13.2-17 25.3-35 35.5c0 0 0 0 0 0c-.1 .1-.3 .1-.4 .2l0 0 0 0c-.3 .2-.6 .3-.9 .5c-35 19.4-90.8 32-153.6 32c-59.6 0-112.9-11.3-148.2-29.1c-1.9-.9-3.7-1.9-5.5-2.9C14.3 274.6 0 258 0 240c0-34.8 53.4-64.5 128-75.4c10.5-1.5 21.4-2.7 32.7-3.5zM416 240c0-21.9-10.6-39.9-24.1-53.4c28.3-4.4 54.2-11.4 76.2-20.5c16.3-6.8 31.5-15.2 43.9-25.5V176c0 19.3-16.5 37.1-43.8 50.9c-14.6 7.4-32.4 13.7-52.4 18.5c.1-1.8 .2-3.5 .2-5.3zm-32 96c0 18-14.3 34.6-38.4 48c-1.8 1-3.6 1.9-5.5 2.9C304.9 404.7 251.6 416 192 416c-62.8 0-118.6-12.6-153.6-32C14.3 370.6 0 354 0 336V300.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 342.6 135.8 352 192 352s108.6-9.4 148.1-25.9c7.8-3.2 15.3-6.9 22.4-10.9c6.1-3.4 11.8-7.2 17.2-11.2c1.5-1.1 2.9-2.3 4.3-3.4V304v5.7V336zm32 0V304 278.1c19-4.2 36.5-9.5 52.1-16c16.3-6.8 31.5-15.2 43.9-25.5V272c0 10.5-5 21-14.9 30.9c-16.3 16.3-45 29.7-81.3 38.4c.1-1.7 .2-3.5 .2-5.3zM192 448c56.2 0 108.6-9.4 148.1-25.9c16.3-6.8 31.5-15.2 43.9-25.5V432c0 44.2-86 80-192 80S0 476.2 0 432V396.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 438.6 135.8 448 192 448z"/>
+        </svg>
+        <span class="d-button-label">打赏</span>
+      `;
+      rewardButton.style.cssText = `
+        color: #f59e0b;
+        margin-left: 5px;
+        display: flex;
+        align-items: center;
+        ${extraStyle}
+      `;
+      return rewardButton;
+    },
+
+    ensureConfigured() {
+      if (ConfigManager.isConfigured()) {
+        return true;
+      }
+
+      if (confirm("您还未配置打赏凭证，是否现在配置？")) {
+        UIManager.showConfigDialog();
+      }
+      return false;
+    },
+
+    setRewardButtonLoading(button, loading) {
+      const label = button.querySelector(".d-button-label");
+      button.disabled = loading;
+      if (label) {
+        label.textContent = loading ? "查询中..." : "打赏";
+      }
     },
 
     processArticle(article) {
@@ -975,31 +1109,16 @@
         return;
       }
 
-      const rewardButton = document.createElement("button");
-      rewardButton.type = "button";
-      rewardButton.className = "reward-button btn btn-icon-text btn-flat";
-      rewardButton.innerHTML = `
-        <svg class="fa d-icon d-icon-coins svg-icon svg-string" style="width: 16px; height: 16px;" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-hidden="true">
-          <path fill="currentColor" d="M512 80c0 18-14.3 34.6-38.4 48c-29.1 16.1-72.5 27.5-122.3 30.9c-3.7-1.8-7.4-3.5-11.3-5C300.6 137.4 248.2 128 192 128c-8.3 0-16.4 .2-24.5 .6l-1.1-.6C142.3 114.6 128 98 128 80c0-44.2 86-80 192-80S512 35.8 512 80zM160.7 161.1c10.2-.7 20.7-1.1 31.3-1.1c62.2 0 117.4 12.3 152.5 31.4C369.3 204.9 384 221.7 384 240c0 4-.7 7.9-2.1 11.7c-4.6 13.2-17 25.3-35 35.5c0 0 0 0 0 0c-.1 .1-.3 .1-.4 .2l0 0 0 0c-.3 .2-.6 .3-.9 .5c-35 19.4-90.8 32-153.6 32c-59.6 0-112.9-11.3-148.2-29.1c-1.9-.9-3.7-1.9-5.5-2.9C14.3 274.6 0 258 0 240c0-34.8 53.4-64.5 128-75.4c10.5-1.5 21.4-2.7 32.7-3.5zM416 240c0-21.9-10.6-39.9-24.1-53.4c28.3-4.4 54.2-11.4 76.2-20.5c16.3-6.8 31.5-15.2 43.9-25.5V176c0 19.3-16.5 37.1-43.8 50.9c-14.6 7.4-32.4 13.7-52.4 18.5c.1-1.8 .2-3.5 .2-5.3zm-32 96c0 18-14.3 34.6-38.4 48c-1.8 1-3.6 1.9-5.5 2.9C304.9 404.7 251.6 416 192 416c-62.8 0-118.6-12.6-153.6-32C14.3 370.6 0 354 0 336V300.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 342.6 135.8 352 192 352s108.6-9.4 148.1-25.9c7.8-3.2 15.3-6.9 22.4-10.9c6.1-3.4 11.8-7.2 17.2-11.2c1.5-1.1 2.9-2.3 4.3-3.4V304v5.7V336zm32 0V304 278.1c19-4.2 36.5-9.5 52.1-16c16.3-6.8 31.5-15.2 43.9-25.5V272c0 10.5-5 21-14.9 30.9c-16.3 16.3-45 29.7-81.3 38.4c.1-1.7 .2-3.5 .2-5.3zM192 448c56.2 0 108.6-9.4 148.1-25.9c16.3-6.8 31.5-15.2 43.9-25.5V432c0 44.2-86 80-192 80S0 476.2 0 432V396.6c12.5 10.3 27.6 18.7 43.9 25.5C83.4 438.6 135.8 448 192 448z"/>
-        </svg>
-        <span class="d-button-label">打赏</span>
-      `;
-      rewardButton.style.cssText = `
-        color: #f59e0b;
-        margin-left: 5px;
-        display: flex;
-        align-items: center;
-      `;
+      const rewardButton = this.createRewardButton(
+        "reward-button btn btn-icon-text btn-flat"
+      );
       rewardButton.title = `打赏 ${fullName}`;
 
       rewardButton.addEventListener("click", (event) => {
         event.preventDefault();
         event.stopPropagation();
 
-        if (!ConfigManager.isConfigured()) {
-          if (confirm("您还未配置打赏凭证，是否现在配置？")) {
-            UIManager.showConfigDialog();
-          }
+        if (!DOMManager.ensureConfigured()) {
           return;
         }
 
@@ -1014,6 +1133,73 @@
       });
 
       controls.insertBefore(rewardButton, controls.firstChild);
+    },
+
+    addUserProfileRewardButton() {
+      const primary = document.querySelector(CONFIG.SELECTORS.PROFILE_PRIMARY);
+      if (!primary) {
+        return;
+      }
+
+      const controls = primary.querySelector(CONFIG.SELECTORS.PROFILE_CONTROLS);
+      if (!controls || controls.querySelector(CONFIG.SELECTORS.REWARD_BUTTON)) {
+        return;
+      }
+
+      const usernameElement = primary.querySelector(
+        CONFIG.SELECTORS.PROFILE_USERNAME
+      );
+      const username =
+        usernameElement?.textContent?.trim() || Utils.getProfileUsernameFromPath();
+      if (!username) {
+        return;
+      }
+
+      const fullNameElement = primary.querySelector(
+        CONFIG.SELECTORS.PROFILE_FULL_NAME
+      );
+      const fullName = fullNameElement?.textContent?.trim() || username;
+      const avatarElement = primary.querySelector(
+        CONFIG.SELECTORS.PROFILE_AVATAR
+      );
+      const avatarUrl = avatarElement?.src || "";
+
+      const item = document.createElement("li");
+      const rewardButton = this.createRewardButton(
+        "reward-button btn btn-icon-text btn-default",
+        "margin-left: 0;"
+      );
+      rewardButton.title = `打赏 ${fullName}`;
+
+      rewardButton.addEventListener("click", async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (!DOMManager.ensureConfigured()) {
+          return;
+        }
+
+        DOMManager.setRewardButtonLoading(rewardButton, true);
+        try {
+          const profileUser = await ProfileAPI.fetchUser(username);
+          UIManager.showRewardDialog(
+            profileUser.userId,
+            profileUser.username,
+            avatarUrl || profileUser.avatarUrl,
+            profileUser.fullName || fullName,
+            "profile",
+            "profile"
+          );
+        } catch (error) {
+          Utils.handleError(ErrorTypes.NETWORK_ERROR, error);
+          alert(`获取用户信息失败\n\n${error?.message || error}`);
+        } finally {
+          DOMManager.setRewardButtonLoading(rewardButton, false);
+        }
+      });
+
+      item.appendChild(rewardButton);
+      controls.insertBefore(item, controls.firstChild);
     },
 
     debouncedAddRewardButtons() {
@@ -1040,7 +1226,7 @@
 
     ConfigManager.checkAndPrompt();
 
-    if (Utils.isTopicPage()) {
+    if (Utils.isRewardSupportedPage()) {
       setTimeout(() => {
         DOMManager.addRewardButtons();
       }, CONFIG.TIMING.INITIAL_LOAD_DELAY);

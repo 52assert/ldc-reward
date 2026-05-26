@@ -1,6 +1,6 @@
 # Linux.do LDC 打赏助手
 
-一个为 Linux.do 社区帖子添加 LDC 打赏按钮的油猴脚本。
+一个为 Linux.do 社区帖子和用户资料页添加 LDC 打赏按钮的油猴脚本。
 
 本仓库是 `ldc-reward` 的 fork 维护版，由 dream 维护。原脚本作者为 [@tbphp](https://linux.do/u/tbphp)，本版本基于原脚本修改，许可证保持 MIT。
 
@@ -13,11 +13,12 @@
 1. 安装 Tampermonkey / Violentmonkey 等用户脚本管理器。
 2. 打开 [`ldc-reward.user.js`](./ldc-reward.user.js)。
 3. 复制脚本内容，新建用户脚本并粘贴保存。
-4. 打开 `https://linux.do/` 的帖子页面使用。
+4. 打开 `https://linux.do/` 的帖子页面或用户资料页使用。
 
 ## 功能
 
 - 在 Linux.do 帖子楼层操作区添加“打赏”按钮。
+- 在 Linux.do 用户资料页操作区添加“打赏”按钮。
 - 支持快捷金额和自定义金额。
 - 使用 Linux.do Credit 商户后台的 `Client ID` / `Client Secret` 发起打赏。
 - 适配新版接口 `https://credit.linux.do/lpay/distribute`。
@@ -28,9 +29,9 @@
 
 1. 前往 Linux.do Credit 商户后台创建应用，获取 `Client ID` 和 `Client Secret`。可参考 [官方文档](https://credit.linux.do/docs/how-to-use)。
 2. 安装并启用本脚本。
-3. 刷新 Linux.do 帖子页面。
+3. 刷新 Linux.do 帖子页面或用户资料页。
 4. 首次使用时按提示填入 `Client ID` 和 `Client Secret`。
-5. 配置完成后，每个可打赏楼层的操作区会出现“打赏”按钮。
+5. 配置完成后，每个可打赏楼层和用户资料页操作区会出现“打赏”按钮。
 
 ## 安全说明
 
@@ -47,8 +48,10 @@
 - 移除 `onfocus`、`onblur`、`onmouseover`、`onmouseout` 等内联事件，避免触发 Linux.do 的严格 CSP。
 - 配置只保留 `Client ID` 和 `Client Secret`，脚本自动生成 `Authorization: Basic ...`。
 - 请求头尽量贴近 Credit 站点页面请求环境。
+- 请求会附带 `remark` 和 `out_trade_no`，便于在 Credit 记录中追踪来源。
 - 403 或解析失败时输出更详细的控制台日志，方便排查。
 - 对用户昵称、头像链接等展示内容做基础转义和校验。
+- 用户资料页通过 Linux.do 同源用户 JSON 接口补齐 `user_id` 后发起打赏。
 
 ## 致谢
 
